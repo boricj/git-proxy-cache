@@ -1,0 +1,133 @@
+name: integration-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ssh-proxy-integration:
+    runs-on: ubuntu-latest
+    env:
+      TEST_SSH_PORT: 2222
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install SSH server and Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server git
+          sudo mkdir -p /var/run/sshd
+
+      - name: Create git and server system users
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo make install PREFIX=/usr/local
+
+          sudo useradd -m -d /home/git -s /usr/local/bin/git-proxy-cache-shell git || true
+          sudo useradd -m -d /home/server -s /bin/bash server || true
+
+          sudo install -d -o git -g git -m 755 /var/lib/git
+
+          sudo mkdir -p /home/git/.ssh /home/server/.ssh
+          sudo chown -R git:git /home/git
+          sudo chown -R server:server /home/server
+          sudo chmod 700 /home/git/.ssh /home/server/.ssh
+
+      - name: Install proxy shell and SSH access keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh-keygen -q -t ed25519 -N '' -f /tmp/client_key
+          cat /tmp/client_key.pub | sudo tee /home/git/.ssh/authorized_keys >/dev/null
+          sudo chown git:git /home/git/.ssh/authorized_keys
+          sudo chmod 600 /home/git/.ssh/authorized_keys
+
+          ssh-keygen -q -t ed25519 -N '' -f /tmp/server_key
+          cat /tmp/server_key.pub | sudo tee /home/server/.ssh/authorized_keys >/dev/null
+          sudo chown server:server /home/server/.ssh/authorized_keys
+          sudo chmod 600 /home/server/.ssh/authorized_keys
+
+          sudo install -m 600 -o git -g git /tmp/server_key /home/git/.ssh/server_key
+          sudo chown git:git /home/git/.ssh/server_key
+
+      - name: Create local upstream bare repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /srv/git
+          sudo chown -R server:server /srv/git
+          sudo -u server git init --bare /srv/git/hello.git >/dev/null
+
+          sudo -u server git init /tmp/server-work >/dev/null
+          sudo chown -R server:server /tmp/server-work
+          sudo -u server bash -lc '
+            cd /tmp/server-work
+            git config user.name "Server User"
+            git config user.email "server@example.invalid"
+            printf "hello from the server\n" > README.md
+            git add README.md
+            git commit -qm "initial commit"
+            git branch -M main
+            git remote add origin /srv/git/hello.git
+            git push origin main
+            git --git-dir=/srv/git/hello.git symbolic-ref HEAD refs/heads/main
+          '
+          sudo rm -rf /tmp/server-work
+
+      - name: Configure the git user's SSH client settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo tee /home/git/.ssh/config >/dev/null <<EOF
+          Host localhost
+              User server
+              Port $TEST_SSH_PORT
+              IdentityFile /home/git/.ssh/server_key
+              StrictHostKeyChecking no
+              UserKnownHostsFile /dev/null
+              BatchMode yes
+          EOF
+          sudo chown git:git /home/git/.ssh/config
+          sudo chmod 600 /home/git/.ssh/config
+
+      - name: Start SSH daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo /usr/sbin/sshd -D -e -p "$TEST_SSH_PORT" &
+
+          for i in $(seq 1 40); do
+            if ssh -p "$TEST_SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/server_key server@localhost 'echo ok' >/tmp/ssh_check.out 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+
+          cat /tmp/ssh_check.out
+          test "$(tail -n 1 /tmp/ssh_check.out)" = "ok"
+
+      - name: Configure insteadOf rewrite rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --replace-all url."ssh://git@localhost:$TEST_SSH_PORT/ssh://".insteadOf "ssh://"
+
+      - name: Verify git ls-remote through the proxy rewrite
+        shell: bash
+        run: |
+          set -euo pipefail
+          GIT_SSH_COMMAND='ssh -i /tmp/client_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' \
+            git ls-remote ssh://server@localhost/srv/git/hello.git | grep -q "refs/heads/main"
+
+      - name: Verify git clone through the proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          GIT_SSH_COMMAND='ssh -i /tmp/client_key -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' \
+            git clone -b main ssh://server@localhost/srv/git/hello.git /tmp/clone
+          test -f /tmp/clone/README.md
+          rm -rf /tmp/clone

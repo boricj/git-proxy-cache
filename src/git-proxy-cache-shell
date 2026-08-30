@@ -1,0 +1,179 @@
+#!/bin/bash
+
+#
+# Git read-only remote cache for SSH.
+#
+# This script is to be used as a shell for a dedicated Git user. Each time a
+# clone/pull is attempted on the cache, it will either:
+#  * fetch everything from the remote if it has already been cloned, or
+#  * attempt to clone the remote.
+#
+# The local repository will then be used as a source to satisfy the request.
+# The end-result is a local cache for remote Git repositories which will most
+# of the time fetch almost nothing from the remote even if the client makes a
+# full clone.
+#
+
+GIT_PATH='/var/lib/git'
+BANNER='Git proxy cache server.'
+LOCK_TIMEOUT_SECONDS=3600
+
+# Redact embedded credentials from URLs before logging or error reporting.
+censor_url() {
+	local url="${1:-}"
+
+	if [[ -z "$url" ]]; then
+		printf '%s\n' "$url"
+		return 0
+	fi
+
+	if [[ "$url" =~ ^(.*://)([^:/@[:space:]]+):([^@/[:space:]]+)@(.+)$ ]]; then
+		printf '%s%s@%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}"
+	else
+		printf '%s\n' "$url"
+	fi
+}
+
+# Convert a supported Git URL or SCP address into the canonical on-disk path.
+# Invalid or unsafe inputs yield the empty string.
+url_to_path() {
+	local input="${1:-}"
+	local normalized_input="${input#/}"
+	local scheme=""
+	local host=""
+	local port=""
+	local raw_path=""
+	local path=""
+	local result=""
+
+	# Reject path traversal attempts.
+	if [[ "$normalized_input" =~ (^|[/:])\.\.($|[/:]) ]]; then
+		echo "$result"
+		return 0
+	fi
+
+	# The URL is expected to have already been redacted by censor_url(), so the
+	# path normalizer only accepts the credential-free form that reaches it.
+	if [[ "$normalized_input" =~ :// ]]; then
+		if [[ "$normalized_input" =~ ^(git|https?|ssh)://([^@[:space:]]+@)?(\[[^][]+\]|[^/:[:space:]]+)(:([0-9]+))?(/.*)?$ ]]; then
+			scheme="${normalized_input%%://*}"
+			host="${BASH_REMATCH[3]}"
+			port="${BASH_REMATCH[5]:-}"
+			raw_path="${BASH_REMATCH[6]:-}"
+			path="${raw_path#/}"
+			path="${path%/}"
+
+			if [[ -n "$path" ]]; then
+				# Always add a .git suffix if it's not already present.
+				if [[ "$path" != *.git ]]; then
+					path+=".git"
+				fi
+
+				# Strip default ports for the relevant schemes so that
+				# equivalent URLs map to the same canonical cache path.
+				case "$scheme" in
+				git) [[ "$port" == "9418" ]] && port="" ;;
+				http) [[ "$port" == "80" ]] && port="" ;;
+				https) [[ "$port" == "443" ]] && port="" ;;
+				ssh) [[ "$port" == "22" ]] && port="" ;;
+				esac
+
+				if [[ -n "$port" ]]; then
+					result="${host,,}:${port}/${path}"
+				else
+					result="${host,,}/${path}"
+				fi
+			fi
+		fi
+	elif [[ "$normalized_input" =~ ^([^@[:space:]]+@)?([^:/[:space:]]+):(.+)$ ]]; then
+		host="${BASH_REMATCH[2]}"
+		raw_path="${BASH_REMATCH[3]}"
+		path="${raw_path#/}"
+		path="${path%/}"
+
+		if [[ -n "$path" ]]; then
+			if [[ "$path" != *.git ]]; then
+				path+=".git"
+			fi
+			result="${host,,}/${path}"
+		fi
+	fi
+
+	echo "$result"
+	return 0
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+	# Drop out if we're sourced so the file can be included from other scripts
+	# without executing the server logic.
+	return 0
+fi
+
+set -e
+
+# Prevent confused deputy scenarios.
+if [[ -n "${HOME:-}" ]] && [[ "$GIT_PATH" == "$HOME" || "$GIT_PATH" == "$HOME"/* ]]; then
+	>&2 echo "mirror: error: GIT_PATH must be outside of the user's home directory."
+	exit 1
+fi
+
+# The service is a Git mirror front-end. Log the banner once at startup.
+>&2 echo "mirror: ${BANNER}"
+
+# Eat -c
+if [ "${1:-}" == '-c' ]; then
+	shift 1
+fi
+
+# OpenSSH commonly passes one command string such as:
+#   git-upload-pack '/ssh://host/repo.git'
+# Parse that form explicitly without eval.
+if [[ $# -eq 1 ]]; then
+	case "$1" in
+	"git-upload-archive "* | "git-upload-pack "* | "git-receive-pack "*)
+		CMD_NAME="${1%% *}"
+		REPO_ARG="${1#* }"
+		REPO_ARG="${REPO_ARG#\'}"
+		REPO_ARG="${REPO_ARG%\'}"
+		set -- "$CMD_NAME" "$REPO_ARG"
+		;;
+	esac
+fi
+
+if [[ "$1" == 'git-upload-archive' || "$1" == 'git-upload-pack' ]]; then
+	REPO_URL="${2:-}"
+	REPO_URL="${REPO_URL#/}"
+	REPO_URL_LOG="$(censor_url "$REPO_URL")"
+	>&2 echo "mirror: Processing download request of '$REPO_URL_LOG'."
+
+	REPO_PATH="$(url_to_path "$REPO_URL")"
+	if [[ -z "$REPO_PATH" ]]; then
+		>&2 echo "mirror: error: unsupported repository URL '$REPO_URL_LOG'"
+		exit 1
+	fi
+
+	LOCK_PATH="${GIT_PATH}/.lock.${REPO_PATH//\//-}"
+	REPO_PATH="${GIT_PATH}/${REPO_PATH}"
+	mkdir -p "$(dirname "$REPO_PATH")"
+
+	if [ ! -d "$REPO_PATH/objects" ]; then
+		>&2 echo "mirror: Cloning from remote $REPO_URL_LOG"
+		flock -w "$LOCK_TIMEOUT_SECONDS" "$LOCK_PATH" git clone --progress --mirror "$REPO_URL" "$REPO_PATH"
+		>&2 echo "mirror: Cloning done."
+	else
+		REPO_ORIGIN_URL="$(cd "$REPO_PATH" && git remote get-url origin)"
+		>&2 echo "mirror: Fetching from remote $(censor_url "$REPO_ORIGIN_URL")"
+		(cd "$REPO_PATH" && flock -w "$LOCK_TIMEOUT_SECONDS" "$LOCK_PATH" git fetch --append) >/dev/null
+		>&2 echo "mirror: Fetching done."
+	fi
+
+	>&2 echo "mirror: Running command: $1 $REPO_PATH"
+	exec "$1" "$REPO_PATH"
+elif [ "$1" == git-receive-pack ]; then
+	>&2 echo "mirror: error: This is a read-only Git cache, upload request denied."
+else
+	>&2 echo "mirror: error: Unknown command '$1'."
+fi
+
+# If we get here then we failed.
+exit 1
